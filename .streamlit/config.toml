@@ -8,7 +8,6 @@ font = "sans serif"
 [server]
 headless = true
 port = 8501
-enableCORS = false
 
 [browser]
 gatherUsageStats = false
@@ -17,5 +16,4 @@ gatherUsageStats = false
 magicEnabled = true
 
 [client]
-showSidebarNavigation = true
 toolbarMode = "minimal"
