@@ -3,9 +3,9 @@
 > **End-to-End ETL + ML Pipeline for Predicting Sustainable "Green Compute Hours" for India's AI Data Centers**
 > *Inspired by Elon Musk's xAI / Tesla / SpaceX Terafab vision – April 2026
 
-##  Live Demo
+## 🔗 Live Demo
 
-
+> **[▶ Launch App on Streamlit Cloud](https://bharat-green-compute-forecaster.streamlit.app)**
 
 ## 💡 Inspiration
 
