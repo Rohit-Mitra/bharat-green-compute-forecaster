@@ -1,6 +1,6 @@
 """
 utils.py
-Shared constants, DB helpers, and domain calculations.
+Constants, DB helpers, green energy scoring.
 """
 
 import os
@@ -16,28 +16,30 @@ MODEL_PATH = os.path.join(DATA_DIR, "model.pkl")
 NASA_BASE_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 NASA_PARAMETERS = "ALLSKY_SFC_SW_DWN,WS10M,T2M"
 
-# --- Solar thresholds (ALLSKY_SFC_SW_DWN is kWh/m2/day from NASA) ---
-# Below this value, solar generation is negligible
-SOLAR_MIN_THRESHOLD = 3.0  # kWh/m2/day
-# Above this value, solar fraction saturates at 1.0
-SOLAR_NORMALIZE_CAP = 6.5  # kWh/m2/day
+# Solar thresholds (ALLSKY_SFC_SW_DWN is kWh/m2/day)
+# India range: 1-7 kWh/m2/day
+# Below 2.0: too weak for meaningful PV generation
+# Above 6.0: near-maximum, fraction saturates at 1.0
+SOLAR_MIN = 2.0
+SOLAR_MAX = 6.0
 
-# --- Wind thresholds (WS10M is m/s from NASA) ---
-# Real turbine power curve zones
-WIND_CUT_IN = 3.5       # below this, turbines don't spin
-WIND_OPTIMAL_LOW = 5.0   # start of peak efficiency band
-WIND_OPTIMAL_HIGH = 15.0  # end of peak efficiency band
-WIND_CUT_OUT = 25.0      # above this, turbines shut down for safety
+# Wind thresholds (WS10M is m/s)
+# Lowered for modern small/medium turbines common in India
+# Source: MNRE small wind turbine specifications
+WIND_CUT_IN = 2.5
+WIND_OPTIMAL_LOW = 4.0
+WIND_OPTIMAL_HIGH = 15.0
+WIND_CUT_OUT = 25.0
 
-# --- Typical solar daylight hours by month in India (hours of usable sun) ---
-# Source: India Meteorological Department averages
-INDIA_SOLAR_HOURS = {
+# Average daylight hours per month across India (hours of sun above horizon)
+# Source: India Meteorological Department
+DAYLIGHT_HOURS = {
     1: 9.5, 2: 10.0, 3: 11.0, 4: 12.0, 5: 12.5, 6: 12.5,
     7: 11.5, 8: 11.0, 9: 11.0, 10: 10.5, 11: 9.5, 12: 9.0,
 }
 
-# --- India grid emission factor (tCO2 per MWh) ---
-# Source: Central Electricity Authority (CEA), CO2 Baseline Database v19, 2024
+# India grid CO2 factor: 0.82 tCO2/MWh
+# Source: Central Electricity Authority, CO2 Baseline Database v19, 2024
 INDIA_GRID_CO2_FACTOR = 0.82
 
 LOCATIONS = {
@@ -64,14 +66,63 @@ LOCATIONS = {
 }
 
 
+def compute_green_score(solar_kwh, wind_ms, month):
+    """
+    Green Compute Hours: hours/day where renewable energy (solar OR wind OR both)
+    can sustain compute loads.
+
+    NOT "both must be active simultaneously." Solar alone during daytime counts.
+    Wind alone at night counts. Having both is a bonus.
+
+    Method:
+        During daylight: P(green) = P(solar) + P(wind) - P(solar)*P(wind)
+        During night: P(green) = P(wind)
+        Total = daylight * P(day_green) + night * P(night_green)
+
+    Returns (green_hours, solar_hours, wind_hours)
+    """
+    # Solar fraction: linear ramp from SOLAR_MIN to SOLAR_MAX
+    if solar_kwh <= SOLAR_MIN:
+        solar_frac = 0.0
+    elif solar_kwh >= SOLAR_MAX:
+        solar_frac = 1.0
+    else:
+        solar_frac = (solar_kwh - SOLAR_MIN) / (SOLAR_MAX - SOLAR_MIN)
+
+    # Wind fraction: turbine power curve
+    if wind_ms < WIND_CUT_IN:
+        wind_frac = 0.0
+    elif wind_ms < WIND_OPTIMAL_LOW:
+        wind_frac = (wind_ms - WIND_CUT_IN) / (WIND_OPTIMAL_LOW - WIND_CUT_IN)
+    elif wind_ms <= WIND_OPTIMAL_HIGH:
+        wind_frac = 1.0
+    elif wind_ms < WIND_CUT_OUT:
+        wind_frac = (WIND_CUT_OUT - wind_ms) / (WIND_CUT_OUT - WIND_OPTIMAL_HIGH)
+    else:
+        wind_frac = 0.0
+
+    daylight = DAYLIGHT_HOURS.get(month, 11.0)
+    night = 24.0 - daylight
+
+    # Daytime: either solar or wind or both generates power
+    # Probability union: P(A or B) = P(A) + P(B) - P(A)*P(B)
+    day_green = min(solar_frac + wind_frac - solar_frac * wind_frac, 1.0)
+
+    # Nighttime: only wind
+    night_green = wind_frac
+
+    green_hours = daylight * day_green + night * night_green
+    solar_hours = daylight * solar_frac
+    wind_hours = 24.0 * wind_frac
+
+    return round(green_hours, 4), round(solar_hours, 4), round(wind_hours, 4)
+
+
+# --- DB helpers ---
+
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
-
-
-def get_db_path():
-    ensure_data_dir()
-    return DB_PATH
 
 
 def get_db_connection():
@@ -122,62 +173,5 @@ def get_model_metrics():
 
 
 def estimate_co2_saved(green_energy_mwh):
-    """
-    CO2 saved in tonnes.
-    green_energy_mwh: total green energy in MWh that displaced grid power.
-    """
+    """CO2 saved in tonnes = green MWh * grid emission factor."""
     return round(green_energy_mwh * INDIA_GRID_CO2_FACTOR, 2)
-
-
-def compute_green_score(solar_kwh, wind_ms, month):
-    """
-    Compute a green energy score (0-24 scale) representing
-    the estimated overlap hours where both solar AND wind
-    are generating usable power.
-
-    This is NOT simply 24 * fraction_a * fraction_b.
-    Instead we compute separate solar and wind viable hours,
-    then estimate their overlap probabilistically.
-
-    Returns (green_score, solar_hours, wind_hours)
-    """
-    # Solar: compute fraction of solar resource available
-    if solar_kwh <= SOLAR_MIN_THRESHOLD:
-        solar_fraction = 0.0
-    else:
-        solar_fraction = min(
-            (solar_kwh - SOLAR_MIN_THRESHOLD) /
-            (SOLAR_NORMALIZE_CAP - SOLAR_MIN_THRESHOLD),
-            1.0,
-        )
-
-    # Solar is only available during daylight
-    daylight = INDIA_SOLAR_HOURS.get(month, 11.0)
-    solar_viable_hours = daylight * solar_fraction
-
-    # Wind: compute fraction from turbine power curve
-    if wind_ms < WIND_CUT_IN:
-        wind_fraction = 0.0
-    elif wind_ms < WIND_OPTIMAL_LOW:
-        wind_fraction = (wind_ms - WIND_CUT_IN) / (WIND_OPTIMAL_LOW - WIND_CUT_IN)
-    elif wind_ms <= WIND_OPTIMAL_HIGH:
-        wind_fraction = 1.0
-    elif wind_ms < WIND_CUT_OUT:
-        wind_fraction = (WIND_CUT_OUT - wind_ms) / (WIND_CUT_OUT - WIND_OPTIMAL_HIGH)
-    else:
-        wind_fraction = 0.0
-
-    # Wind can blow 24 hours
-    wind_viable_hours = 24.0 * wind_fraction
-
-    # Overlap estimation:
-    # P(both available in a given hour) = P(solar_on) * P(wind_on)
-    # assuming independence, which is a reasonable first-order assumption
-    p_solar = solar_viable_hours / 24.0
-    p_wind = wind_viable_hours / 24.0
-    overlap_hours = 24.0 * p_solar * p_wind
-
-    # But overlap cannot exceed the smaller of the two
-    overlap_hours = min(overlap_hours, solar_viable_hours, wind_viable_hours)
-
-    return round(overlap_hours, 4), round(solar_viable_hours, 4), round(wind_viable_hours, 4)
