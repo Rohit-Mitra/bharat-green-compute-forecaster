@@ -20,7 +20,7 @@ NASA_PARAMETERS = "ALLSKY_SFC_SW_DWN,WS10M,T2M"
 # India range: 1-7 kWh/m2/day
 # Below 2.0: too weak for meaningful PV generation
 # Above 6.0: near-maximum, fraction saturates at 1.0
-SOLAR_MIN = 2.0
+SOLAR_MIN = 2.5
 SOLAR_MAX = 6.0
 
 # Wind thresholds (WS10M is m/s)
@@ -65,19 +65,27 @@ LOCATIONS = {
     },
 }
 
-
 def compute_green_score(solar_kwh, wind_ms, month):
     """
-    Green Compute Hours: hours/day where renewable energy (solar OR wind OR both)
-    can sustain compute loads.
+    Green Compute Hours: hours/day where renewable energy can reliably
+    sustain data center compute loads.
 
-    NOT "both must be active simultaneously." Solar alone during daytime counts.
-    Wind alone at night counts. Having both is a bonus.
+    A data center needs RELIABLE power, not intermittent trickles.
+    - Solar alone at moderate levels: partial credit (intermittent clouds)
+    - Wind alone at moderate levels: partial credit (gusty)
+    - Both together: full credit (reliable)
+    - Either one at very high levels: full credit (strong enough alone)
 
-    Method:
-        During daylight: P(green) = P(solar) + P(wind) - P(solar)*P(wind)
-        During night: P(green) = P(wind)
-        Total = daylight * P(day_green) + night * P(night_green)
+    Formula per time period:
+        reliability = solar_frac * wind_frac              (both active: reliable)
+                    + solar_frac^2 * (1 - wind_frac)      (strong solar alone)
+                    + wind_frac^2 * (1 - solar_frac)       (strong wind alone)
+
+    This means:
+        solar=0.5, wind=0.0 -> 0.25 (weak solar alone = low reliability)
+        solar=0.9, wind=0.0 -> 0.81 (strong solar alone = decent)
+        solar=0.5, wind=0.5 -> 0.50 (moderate both = moderate reliability)
+        solar=0.9, wind=0.9 -> 0.97 (strong both = excellent)
 
     Returns (green_hours, solar_hours, wind_hours)
     """
@@ -104,19 +112,25 @@ def compute_green_score(solar_kwh, wind_ms, month):
     daylight = DAYLIGHT_HOURS.get(month, 11.0)
     night = 24.0 - daylight
 
-    # Daytime: either solar or wind or both generates power
-    # Probability union: P(A or B) = P(A) + P(B) - P(A)*P(B)
-    day_green = min(solar_frac + wind_frac - solar_frac * wind_frac, 1.0)
+    # Reliability-weighted score
+    # Both active = reliable. One alone = only reliable if strong.
+    def reliability(s, w):
+        both = s * w
+        solar_only = (s ** 2) * (1 - w)
+        wind_only = (w ** 2) * (1 - s)
+        return min(both + solar_only + wind_only, 1.0)
 
-    # Nighttime: only wind
-    night_green = wind_frac
+    # Daytime: both solar and wind can contribute
+    day_score = reliability(solar_frac, wind_frac)
 
-    green_hours = daylight * day_green + night * night_green
+    # Nighttime: only wind (solar_frac = 0)
+    night_score = reliability(0.0, wind_frac)
+
+    green_hours = daylight * day_score + night * night_score
     solar_hours = daylight * solar_frac
     wind_hours = 24.0 * wind_frac
 
     return round(green_hours, 4), round(solar_hours, 4), round(wind_hours, 4)
-
 
 # --- DB helpers ---
 
